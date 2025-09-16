@@ -6,7 +6,7 @@
 input/
 output/
 processed/
-
+manifests/*.m3u8
 # --- Video encoding artefacts ---
 *.ts
 *.m3u8

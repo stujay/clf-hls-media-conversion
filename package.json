@@ -1,0 +1,11 @@
+{
+  "name": "clf-hls",
+  "private": true,
+  "scripts": {
+    "hls:encode": "bin/hls-encode.sh -t -S --thumb-interval 10",
+    "hls:upload": "bin/hls-upload.sh",
+    "hls:all": "bin/hls-all.sh --prefix videos --parallel 3 -t -S --thumb-interval 10",
+    "hls:all:hls": "bin/hls-all.sh --prefix hls --parallel 3 -t -S --thumb-interval 10",
+    "hls:invalidate": "bin/cf-invalidate.sh"
+  }
+}

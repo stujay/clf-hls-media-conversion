@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${ROOT_DIR}/.env" 2>/dev/null || true
+
+RED='\033[0;31m'; YEL='\033[0;33m'; GRN='\033[0;32m'; NC='\033[0m'
+
+require() { command -v "$1" >/dev/null 2>&1 || { echo -e "${RED}Missing $1${NC}"; exit 1; }; }
+require ffmpeg
+require awk
+command -v aws >/dev/null 2>&1 || echo -e "${YEL}aws CLI not found; upload will fail until installed${NC}"
+
+usage() {
+  cat <<EOF
+Usage:
+  ${0##*/} encode  --input <file.mp4> --course <slug> --slug <video-slug> [--outdir <dir>] [--dry-run]
+  ${0##*/} upload  --course <slug> --slug <video-slug> [--src <dir>] [--dry-run]
+  ${0##*/} all     --input <file.mp4> --course <slug> --slug <video-slug> [--outdir <dir>] [--dry-run]
+  ${0##*/} batch   --manifest manifests/sample.csv [--mode encode|upload|all] [--dry-run]
+
+CSV manifest columns (no header):
+  /abs/path/to/video.mp4,course-slug,video-slug
+ENV defaults in .env control renditions, bucket, region, etc.
+EOF
+}
+
+log() { echo -e "${GRN}[$(date +%H:%M:%S)]${NC} $*"; }
+
+scale_for_height() {
+  local height="$1"
+  case "$height" in
+    1080) echo "1920:1080" ;;
+    720)  echo "1280:720"  ;;
+    480)  echo "854:480"   ;;
+    360)  echo "640:360"   ;;
+    *)    echo "-2:${height}" ;; # even width auto
+  esac
+}
+
+make_master() {
+  local outdir="$1"; shift
+  cat > "${outdir}/master.m3u8" <<EOF
+#EXTM3U
+#EXT-X-VERSION:7
+EOF
+  for v in "${outdir}"/*p.m3u8; do
+    [ -f "$v" ] || continue
+    local name res bw
+    name="$(basename "$v")"
+    case "$name" in
+      1080p.m3u8) res="1920x1080"; bw=6500000;;
+      720p.m3u8)  res="1280x720";  bw=3500000;;
+      480p.m3u8)  res="854x480";   bw=1700000;;
+      360p.m3u8)  res="640x360";   bw=900000;;
+      *) res="1280x720"; bw=3000000;;
+    esac
+    cat >> "${outdir}/master.m3u8" <<EOF
+#EXT-X-STREAM-INF:BANDWIDTH=${bw},RESOLUTION=${res},CODECS="avc1.640028,mp4a.40.2"
+${name}
+EOF
+  done
+}
+
+do_encode() {
+  local input="" course="" slug="" outdir="${ROOT_DIR}/build"
+  local dry="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --input) input="$2"; shift 2;;
+      --course) course="$2"; shift 2;;
+      --slug) slug="$2"; shift 2;;
+      --outdir) outdir="$2"; shift 2;;
+      --dry-run) dry="true"; shift;;
+      *) echo "Unknown arg: $1"; usage; exit 1;;
+    esac
+  done
+
+  [[ -f "$input" ]] || { echo "Input not found: $input"; exit 1; }
+  [[ -n "$course" && -n "$slug" ]] || { echo "course/slug required"; exit 1; }
+
+  local target="${outdir}/${course}/${slug}"
+  mkdir -p "$target"
+
+  log "Encoding → ${target}"
+  $dry && { echo "[dry-run] would encode $input"; return 0; }
+
+  # Build filter_complex splits equal to rendition count
+  IFS=' ' read -r -a RENDS <<< "$RENDITIONS"
+  local n="${#RENDS[@]}"
+  local split=""; local idx=0
+  for _r in "${RENDS[@]}"; do
+    split="$split[v$idx]"; ((idx++))
+  done
+  local fc="[0:v]split=${n}${split}; "
+
+  # Per-rendition scale maps and ffmpeg args
+  idx=0
+  declare -a MAP_OPTS=()
+  for r in "${RENDS[@]}"; do
+    IFS=':' read -r H VB AB <<< "$r"
+    local RES; RES=$(scale_for_height "$H")
+    fc="${fc}[v$idx]scale=w=${RES%%:*}:h=${RES##*:}:force_original_aspect_ratio=decrease:flags=lanczos[v${idx}s]; "
+    MAP_OPTS+=(
+      -map "[v${idx}s]" -map 0:a:0
+      -c:v h264 -profile:v $( [[ "$H" -ge 720 ]] && echo high || echo main ) \
+      -level $( [[ "$H" -ge 1080 ]] && echo 4.1 || echo 4.0 ) \
+      -preset "${FF_PRESET}" -crf 22 \
+      -b:v "$VB" -maxrate "$VB" -bufsize "$(( ${VB%k} * 2 ))k" \
+      -c:a aac -b:a "$AB" -ac 2 \
+      -f hls -hls_time "${SEG_DUR}" -hls_playlist_type vod \
+      -hls_segment_type fmp4 -hls_flags independent_segments \
+      -var_stream_map "v:0,a:0" \
+      -hls_segment_filename "${target}/${H}p_%03d.m4s" \
+      -hls_fmp4_init_filename "${H}p_init.mp4" \
+      "${target}/${H}p.m3u8"
+    )
+    ((idx++))
+  done
+
+  ffmpeg -y -i "$input" \
+    -filter_complex "$fc" \
+    "${MAP_OPTS[@]}"
+
+  make_master "$target"
+  log "Done: ${target}/master.m3u8"
+}
+
+do_upload() {
+  local course="" slug="" src="${ROOT_DIR}/build"
+  local dry="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --course) course="$2"; shift 2;;
+      --slug) slug="$2"; shift 2;;
+      --src) src="$2"; shift 2;;
+      --dry-run) dry="true"; shift;;
+      *) echo "Unknown arg: $1"; usage; exit 1;;
+    esac
+  done
+  [[ -n "$course" && -n "$slug" ]] || { echo "course/slug required"; exit 1; }
+
+  local path="${src}/${course}/${slug}"
+  [[ -d "$path" ]] || { echo "Missing local path: $path"; exit 1; }
+
+  local dst="${S3_BUCKET}/${BASE_PREFIX}/${course}/${slug}/"
+  log "Uploading → ${dst}"
+
+  $dry && { echo "[dry-run] would sync ${path} to ${dst}"; return 0; }
+
+  # m3u8 as HLS type
+  aws s3 sync "$path" "$dst" \
+    --exclude "*" --include "*.m3u8" \
+    --content-type "application/vnd.apple.mpegurl" \
+    ${AWS_PROFILE:+--profile "$AWS_PROFILE"} ${AWS_REGION:+--region "$AWS_REGION"}
+
+  # init segments + fragments as mp4
+  aws s3 sync "$path" "$dst" \
+    --exclude "*" --include "*_init.mp4" --include "*.m4s" \
+    --content-type "video/mp4" \
+    ${AWS_PROFILE:+--profile "$AWS_PROFILE"} ${AWS_REGION:+--region "$AWS_REGION"}
+
+  log "Upload complete."
+}
+
+do_all() {
+  do_encode "$@"
+  # pass the same args to upload but translate known flags
+  local args=("$@")
+  # strip --input and --outdir for upload
+  local up=()
+  local i=0
+  while [[ $i -lt ${#args[@]} ]]; do
+    case "${args[$i]}" in
+      --input|--outdir) ((i+=2)); continue;;
+    esac
+    up+=("${args[$i]}")
+    ((i++))
+  done
+  do_upload "${up[@]}"
+}
+
+do_batch() {
+  local manifest="" mode="all" dry="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --manifest) manifest="$2"; shift 2;;
+      --mode) mode="$2"; shift 2;;
+      --dry-run) dry="true"; shift;;
+      *) echo "Unknown arg: $1"; usage; exit 1;;
+    esac
+  done
+  [[ -f "$manifest" ]] || { echo "Manifest not found: $manifest"; exit 1; }
+
+  while IFS=, read -r input course slug; do
+    input="$(echo "$input" | xargs)"
+    course="$(echo "$course" | xargs)"
+    slug="$(echo "$slug" | xargs)"
+    [[ -z "$input" || "$input" =~ ^# ]] && continue
+    case "$mode" in
+      encode) do_encode --input "$input" --course "$course" --slug "$slug" --dry-run=$dry ;;
+      upload) do_upload --course "$course" --slug "$slug" --dry-run=$dry ;;
+      all)    do_all    --input "$input" --course "$course" --slug "$slug" --dry-run=$dry ;;
+      *) echo "Unknown mode: $mode"; exit 1;;
+    esac
+  done < "$manifest"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  encode) do_encode "$@";;
+  upload) do_upload "$@";;
+  all)    do_all "$@";;
+  batch)  do_batch "$@";;
+  *) usage; exit 1;;
+esac

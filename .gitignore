@@ -1,0 +1,25 @@
+# --- Environment / secrets ---
+.env
+.env.*        # any env files (e.g. .env.hls, .env.local)
+
+# --- Build artefacts ---
+input/
+output/
+processed/
+
+# --- Video encoding artefacts ---
+*.ts
+*.m3u8
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# --- Logs / temp ---
+*.log
+*.tmp
+
+# --- Node/npm (if you happen to initialise a package.json here) ---
+node_modules/

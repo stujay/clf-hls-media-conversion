@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
+# bin/hls-encode.sh
 # Robust HLS encoder for VOD:
 # - Auto FPS/GOP from input
 # - Rotation-aware + optional deinterlace
 # - Even dimensions + pad to rung, SAR=1, fixed FPS
 # - ABR ladder with aligned keyframes
-# - Hardened WxH parsing + ladder sanitization
-# - Optional parallel encoding (no xargs; throttled bg jobs)
+# - Hardened WxH parsing + ladder sanitisation
+# - ALWAYS builds master.m3u8
+# - Optional thumbnails (per-image or sprite sheets) + WebVTT; non-fatal if they fail
 
 set -euo pipefail
 
 ############################################
-# Defaults (override via env or flags)
+# Defaults (override via flags or env)
 ############################################
 SEG_DUR="${SEG_DUR:-6}"         # segment duration (seconds)
 PARALLEL="${PARALLEL:-1}"       # concurrent renditions
+
 # Ladder entries: WxH:vbit:buf:maxrate:audio_kbps
 LADDER_DEFAULT=(
   "1920x1080:6000k:12000k:7800k:128"
@@ -22,19 +25,38 @@ LADDER_DEFAULT=(
   "640x360:800k:1600k:1100k:96"
 )
 
+# Thumbnails (off by default)
+THUMBS="${THUMBS:-0}"                # 1 to enable (or use -t / --thumbs)
+THUMB_EVERY_SEC="${THUMB_EVERY_SEC:-10}"
+THUMB_W="${THUMB_W:-160}"            # width per thumb (height auto)
+THUMB_FMT="${THUMB_FMT:-webp}"       # webp|jpg|png
+THUMB_SPRITES="${THUMB_SPRITES:-0}"  # 1 = sprite sheets; 0 = per-image
+SPRITE_COLS="${SPRITE_COLS:-10}"     # columns per sprite
+SPRITE_ROWS="${SPRITE_ROWS:-10}"     # rows per sprite
+
 usage() {
   cat <<EOF
 Usage:
-  $0 [-s SEG_DUR] [-p PARALLEL] [-l LADDER_FILE] <input> <output_dir>
+  $0 [options] <input> <output_dir>
 
 Options:
-  -s SEG_DUR       Segment duration (default: ${SEG_DUR})
-  -p PARALLEL      Parallel renditions (default: ${PARALLEL})
-  -l LADDER_FILE   File with lines: WxH:vbit:buf:maxrate:audio_kbps
+  -s, --seg N            HLS segment duration seconds (default ${SEG_DUR})
+  -p, --parallel N       Parallel renditions (default ${PARALLEL})
+  -l, --ladder FILE      File with lines: WxH:vbit:buf:maxrate:audio_kbps
+
+Thumbnails:
+  -t, --thumbs           Enable thumbnail generation (also THUMBS=1)
+  -S, --sprites          Use sprite sheets (also THUMB_SPRITES=1)
+  --thumb-interval N     Seconds between thumbs (default ${THUMB_EVERY_SEC})
+  --thumb-width N        Width per thumb (default ${THUMB_W})
+  --thumb-fmt FMT        webp|jpg|png (default ${THUMB_FMT})
+  --sprite-cols N        Columns per sprite (default ${SPRITE_COLS})
+  --sprite-rows N        Rows per sprite (default ${SPRITE_ROWS})
 
 Examples:
   $0 input/video.mp4 output/my-video
-  SEG_DUR=4 PARALLEL=2 $0 input.mp4 out_dir
+  THUMBS=1 THUMB_SPRITES=1 $0 input.mp4 out_dir
+  $0 -t -S --thumb-interval 8 input.mp4 out_dir
 EOF
   exit 1
 }
@@ -43,15 +65,24 @@ EOF
 # Parse flags
 ############################################
 LADDER_FILE=""
-while getopts ":s:p:l:" opt; do
-  case "$opt" in
-    s) SEG_DUR="$OPTARG" ;;
-    p) PARALLEL="$OPTARG" ;;
-    l) LADDER_FILE="$OPTARG" ;;
-    *) usage ;;
+while (( $# )); do
+  case "${1:-}" in
+    -s|--seg)            SEG_DUR="${2:?}"; shift 2 ;;
+    -p|--parallel)       PARALLEL="${2:?}"; shift 2 ;;
+    -l|--ladder)         LADDER_FILE="${2:?}"; shift 2 ;;
+    -t|--thumbs)         THUMBS="1"; shift ;;
+    -S|--sprites)        THUMB_SPRITES="1"; THUMBS="1"; shift ;;
+    --thumb-interval)    THUMB_EVERY_SEC="${2:?}"; shift 2 ;;
+    --thumb-width)       THUMB_W="${2:?}"; shift 2 ;;
+    --thumb-fmt)         THUMB_FMT="${2:?}"; shift 2 ;;
+    --sprite-cols)       SPRITE_COLS="${2:?}"; shift 2 ;;
+    --sprite-rows)       SPRITE_ROWS="${2:?}"; shift 2 ;;
+    -h|--help)           usage ;;
+    --)                  shift; break ;;
+    -* )                 echo "Unknown option: $1" >&2; usage ;;
+    * )                  break ;;
   esac
 done
-shift $((OPTIND-1))
 
 in="${1:-}"
 out="${2:-}"
@@ -59,16 +90,11 @@ out="${2:-}"
 
 mkdir -p "${out}"
 
-need() {
-  command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" >&2; exit 1; }
-}
-need ffmpeg
-need ffprobe
-need jq
-need python3
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" >&2; exit 1; }; }
+need ffmpeg; need ffprobe; need jq; need python3
 
 ############################################
-# Load + sanitize ladder
+# Load + sanitise ladder
 ############################################
 ladder=()
 load_ladder_line() {
@@ -79,21 +105,12 @@ load_ladder_line() {
   ladder+=("${line}")
   return 0
 }
-
 if [[ -n "${LADDER_FILE}" ]]; then
-  while IFS= read -r raw; do
-    load_ladder_line "${raw}" || true
-  done < "${LADDER_FILE}"
+  while IFS= read -r raw; do load_ladder_line "${raw}" || true; done < "${LADDER_FILE}"
 else
-  for raw in "${LADDER_DEFAULT[@]}"; do
-    load_ladder_line "${raw}" || true
-  done
+  for raw in "${LADDER_DEFAULT[@]}"; do load_ladder_line "${raw}" || true; done
 fi
-
-if [[ "${#ladder[@]}" -eq 0 ]]; then
-  echo "No ladder entries found. Exiting." >&2
-  exit 1
-fi
+[[ "${#ladder[@]}" -gt 0 ]] || { echo "No ladder entries found."; exit 1; }
 
 ############################################
 # Probe input metadata
@@ -125,9 +142,9 @@ GOP=$(( SEG_DUR * FPS_INT ))
 ROTATE="$(echo "${probe_json}" | jq -r '.streams[] | select(.codec_type=="video") | .side_data_list[]?.rotation // empty' | head -n1)"
 ROTATE="${ROTATE:-0}"
 case "${ROTATE}" in
-  90|-270) ROT_FILTER="transpose=1" ;;      # clockwise
+  90|-270) ROT_FILTER="transpose=1" ;;
   180|-180) ROT_FILTER="hflip,vflip" ;;
-  270|-90) ROT_FILTER="transpose=2" ;;      # counter-clockwise
+  270|-90) ROT_FILTER="transpose=2" ;;
   *) ROT_FILTER="" ;;
 esac
 
@@ -144,29 +161,18 @@ esac
 ############################################
 encode_one() {
   local idx="$1" spec="$2"
-
   local size vbit buf maxrate akbps
   IFS=: read -r size vbit buf maxrate akbps <<< "${spec}"
 
-  # sanitize WxH
   size="$(printf '%s' "$size" | tr -d '[:space:]')"
-  if [[ ! "${size}" =~ ^[0-9]+x[0-9]+$ ]]; then
-    echo "Bad ladder size token '${size}' in spec '${spec}'" >&2
-    exit 1
-  fi
+  [[ "${size}" =~ ^[0-9]+x[0-9]+$ ]] || { echo "Bad ladder size '${size}'"; exit 1; }
 
-  # pure bash WxH split
-  local W="${size%%x*}"
-  local H="${size##*x}"
-  if [[ -z "${W}" || -z "${H}" || ! "${W}" =~ ^[0-9]+$ || ! "${H}" =~ ^[0-9]+$ ]]; then
-    echo "Failed to parse WxH from '${size}' (W='${W}', H='${H}') in spec '${spec}'" >&2
-    exit 1
-  fi
+  local W="${size%%x*}"; local H="${size##*x}"
+  [[ "${W}" =~ ^[0-9]+$ && "${H}" =~ ^[0-9]+$ ]] || { echo "Bad WxH '${size}'"; exit 1; }
 
   local variant="${out}/v${idx}.m3u8"
   local seg_tmpl="${out}/v${idx}_%05d.ts"
 
-  # build video filter chain
   local filters=()
   [[ -n "${ROT_FILTER}" ]] && filters+=("${ROT_FILTER}")
   [[ -n "${DEINTERLACE_FILTER}" ]] && filters+=("${DEINTERLACE_FILTER}")
@@ -174,8 +180,7 @@ encode_one() {
   filters+=("pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=black")
   filters+=("setsar=1")
   filters+=("fps=${FPS_INT}")
-  local vf
-  vf="$(IFS=, ; echo "${filters[*]}")"
+  local vf; vf="$(IFS=, ; echo "${filters[*]}")"
 
   local AUDIO="-c:a aac -b:a ${akbps}k -ac 2 -ar 48000"
 
@@ -200,24 +205,17 @@ export in out SEG_DUR GOP ROT_FILTER DEINTERLACE_FILTER FPS_INT
 ############################################
 # Dispatch (sequential or throttled parallel)
 ############################################
-pids=()
-idx=0
+pids=(); idx=0
 for spec in "${ladder[@]}"; do
   if (( PARALLEL > 1 )); then
     encode_one "${idx}" "${spec}" &
     pids+=("$!")
-
-    # throttle: keep at most PARALLEL running
-    while (( $(jobs -rp | wc -l) >= PARALLEL )); do
-      sleep 0.2
-    done
+    while (( $(jobs -rp | wc -l) >= PARALLEL )); do sleep 0.2; done
   else
     encode_one "${idx}" "${spec}"
   fi
   ((idx++))
 done
-
-# wait for background jobs
 wait "${pids[@]}" 2>/dev/null || true
 
 ############################################
@@ -233,25 +231,89 @@ master="${out}/master.m3u8"
 idx=0
 for spec in "${ladder[@]}"; do
   IFS=: read -r size vbit buf maxrate akbps <<< "${spec}"
-
-  # only include if the variant playlist exists
   if [[ -f "${out}/v${idx}.m3u8" ]]; then
-    # BANDWIDTH (bits/sec) ≈ maxrate + audio
-    MAXK="${maxrate%k}"
-    ABIT=$(( akbps * 1000 ))
-    VBITS=$(( MAXK * 1000 ))
-    TOTAL=$(( VBITS + ABIT ))
-
-    # Optional: average bandwidth hint (90% of max is a decent heuristic)
-    AVG=$(( (VBITS * 9 / 10) + ABIT ))
-
+    MAXK="${maxrate%k}"; ABIT=$(( akbps * 1000 )); VBITS=$(( MAXK * 1000 ))
+    TOTAL=$(( VBITS + ABIT )); AVG=$(( (VBITS * 9 / 10) + ABIT ))
     {
       echo "#EXT-X-STREAM-INF:BANDWIDTH=${TOTAL},AVERAGE-BANDWIDTH=${AVG},RESOLUTION=${size},CODECS=\"avc1.640028,mp4a.40.2\",FRAME-RATE=${FPS_INT}"
       echo "v${idx}.m3u8"
     } >> "${master}"
   fi
-
   ((idx++))
 done
+
+############################################
+# Optional thumbnails + WebVTT (never fatal)
+############################################
+if [[ "${THUMBS}" == "1" ]]; then
+  thumbs_dir="${out}/thumbs"; mkdir -p "${thumbs_dir}"
+  if [[ "${THUMB_SPRITES}" == "0" ]]; then
+    # Per-image thumbs
+    if ffmpeg -hide_banner -nostdin -y -i "${in}" -vf "fps=1/${THUMB_EVERY_SEC},scale=${THUMB_W}:-2" "${thumbs_dir}/thumb_%05d.${THUMB_FMT}" 2>/dev/null; then
+      vtt="${thumbs_dir}/thumbs.vtt"
+      {
+        echo "WEBVTT"
+        n=1; t0=0
+        while :; do
+          f=$(printf "thumb_%05d.%s" "${n}" "${THUMB_FMT}")
+          [[ -f "${thumbs_dir}/${f}" ]] || break
+          t1=$(( t0 + THUMB_EVERY_SEC ))
+          printf "\n%02d:%02d:%02d.000 --> %02d:%02d:%02d.000\n" \
+            $((t0/3600)) $(((t0%3600)/60)) $((t0%60)) \
+            $((t1/3600)) $(((t1%3600)/60)) $((t1%60))
+          echo "${f}"
+          t0=$t1; n=$((n+1))
+        done
+      } > "${vtt}"
+    else
+      echo "⚠ Thumbnail extraction failed; continuing." >&2
+    fi
+  else
+    # Sprite sheets
+    tmp="${out}/.thumbs_tmp"; mkdir -p "${tmp}"
+    if ffmpeg -hide_banner -nostdin -y -i "${in}" -vf "fps=1/${THUMB_EVERY_SEC},scale=${THUMB_W}:-2" "${tmp}/f_%06d.png" 2>/dev/null; then
+      first="${tmp}/f_000001.png"
+      if [[ -f "${first}" ]]; then
+        read -r FW FH < <(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${first}")
+        THUMB_H="${FH:-90}"
+        N=$(( SPRITE_COLS * SPRITE_ROWS ))
+        count=$(ls "${tmp}"/f_*.png 2>/dev/null | wc -l | tr -d ' ')
+        mkdir -p "${thumbs_dir}"
+        frame_i=1; sheet_index=0
+        while (( frame_i <= count )); do
+          list="${tmp}/list_${sheet_index}.txt"; : > "${list}"; local_n=0
+          while (( local_n < N && frame_i <= count )); do
+            printf "file '%s'\n" "${tmp}/f_$(printf "%06d" "${frame_i}").png" >> "${list}"
+            frame_i=$(( frame_i + 1 )); local_n=$(( local_n + 1 ))
+          done
+          sheet="${thumbs_dir}/sprite_$(printf "%03d" ${sheet_index}).${THUMB_FMT}"
+          ffmpeg -hide_banner -nostdin -y -f concat -safe 0 -i "${list}" -filter_complex "tile=${SPRITE_COLS}x${SPRITE_ROWS}" -frames:v 1 "${sheet}" >/dev/null 2>&1 || true
+          sheet_index=$(( sheet_index + 1 ))
+        done
+        vtt="${thumbs_dir}/thumbs.vtt"
+        {
+          echo "WEBVTT"
+          sec0=0; f=1; sheet_index=0
+          while (( f <= count )); do
+            pos=$(( ( (f-1) % N ) ))
+            col=$(( pos % SPRITE_COLS )); row=$(( pos / SPRITE_COLS ))
+            x=$(( col * THUMB_W )); y=$(( row * THUMB_H ))
+            sec1=$(( sec0 + THUMB_EVERY_SEC ))
+            printf "\n%02d:%02d:%02d.000 --> %02d:%02d:%02d.000\n" \
+              $((sec0/3600)) $(((sec0%3600)/60)) $((sec0%60)) \
+              $((sec1/3600)) $(((sec1%3600)/60)) $((sec1%60))
+            echo "sprite_$(printf "%03d" ${sheet_index}).${THUMB_FMT}#xywh=${x},${y},${THUMB_W},${THUMB_H}"
+            sec0=$(( sec1 ))
+            (( f % N == 0 )) && sheet_index=$(( sheet_index + 1 ))
+            f=$(( f + 1 ))
+          done
+        } > "${vtt}"
+      fi
+    else
+      echo "⚠ Sprite generation failed; continuing." >&2
+    fi
+    rm -rf "${tmp}" || true
+  fi
+fi
 
 echo "✅ Encoded HLS -> ${out}"

@@ -1,5 +1,22 @@
 # CLF HLS Bash Workflow — Staff Instructions
 
+## TL;DR 
+
+Single file (encode + master + thumbs + upload to /videos/<slug>):
+
+```
+
+./bin/hls-encode.sh -t -S --thumb-interval 10 input/ctf-s1-e1-intro.mp4 output/ctf-s1-e1-intro
+./bin/hls-upload.sh output/ctf-s1-e1-intro videos/ctf-s1-e1-intro
+
+```
+Batch everything in ./input with sprites, pushing to /videos/<slug>, with 3 encodes in parallel:
+
+```
+./bin/hls-all.sh --prefix videos --parallel 3 -t -S --thumb-interval 10
+
+```
+
 ## 1. `bin/hls-all.sh` — Batch encode → upload
 
 **Use when:**  

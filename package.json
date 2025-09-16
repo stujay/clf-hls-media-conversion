@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "hls:encode": "bin/hls-encode.sh",
+    "hls:encode": "THUMBS=1 THUMB_SPRITES=1 bin/hls-encode.sh",
+    "hls:all": "THUMBS=1 THUMB_SPRITES=1 bin/hls-all.sh --parallel 3",
     "hls:upload": "bin/hls-upload.sh",
-    "hls:all": "bin/hls-all.sh",
     "hls:invalidate": "bin/cf-invalidate.sh"
   }
 }

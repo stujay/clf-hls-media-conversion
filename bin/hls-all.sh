@@ -34,11 +34,9 @@ while (( $# )); do
     -h|--help)
       cat <<EOF
 Usage: $0 [--parallel N] [--prefix PATH] [thumbnail/encode flags...]
-
 Options:
   --parallel N          Process N files concurrently (xargs)
   --prefix PATH         S3 prefix (default "hls"; e.g. "videos")
-
 Pass-through (to hls-encode.sh):
   -t, --thumbs
   -S, --sprites
@@ -55,9 +53,13 @@ EOF
   esac
 done
 
-shopt -s nullglob
-mapfile -t files < <(find "${root}/input" -type f -name '*.mp4' | sort)
-shopt -u nullglob
+# -------- portable file collection (no 'mapfile') ----------
+files=()
+while IFS= read -r f; do
+  # skip empty lines just in case
+  [[ -n "$f" ]] && files+=("$f")
+done < <(find "${root}/input" -type f -name '*.mp4' | sort)
+# -----------------------------------------------------------
 
 if [[ ${#files[@]} -eq 0 ]]; then
   echo "No .mp4 files found in ${root}/input"
@@ -66,7 +68,8 @@ fi
 
 process_one() {
   local src="$1"
-  local base="$(basename "${src}" .mp4)"
+  local base
+  base="$(basename "${src}" .mp4)"
   local out="${root}/output/${base}"
 
   echo "→ Encoding: ${src} → ${out}"

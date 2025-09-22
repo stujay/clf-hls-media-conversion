@@ -236,9 +236,3 @@ export const handle: Handle = async ({ event, resolve }) => {
 - **Observability**: CloudFront logs to S3 + Athena/Lake Formation for analytics.
 
 ---
-
-## Next Actions for Current Error
-1. Add `media.crackinglanguage.com` (or your actual CDN host) to `connect-src` and `media-src` in CSP.
-2. If using the raw CloudFront hostname, temporarily allow `https://*.cloudfront.net` in CSP while migrating to a CNAME.
-3. Confirm S3/CloudFront CORS headers include `Range` and expose `Content-Range`.
-4. Re-test the lesson: `/api/media-url?key=ctf-s1-e1-intro` should yield a URL that loads `master.m3u8` without CSP or CORS errors.
